@@ -1,0 +1,17 @@
+[Unit]
+Description=ModSecurity Rule 777007 Bad Bot Monitor + CSF Integration
+After=network.target lsws.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/modsec_ip_tracker.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+# Optional: Run as root (needed for CSF)
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
