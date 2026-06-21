@@ -275,7 +275,10 @@ def run_cycle(blocked: set) -> bool:
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
             f.seek(saved_offset)
-            for line in f:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
                 if RULE_ID in line:
                     ip_m = _IP_RE.search(line)
                     ua_m = _UA_RE.search(line)
