@@ -1,0 +1,36 @@
+[Unit]
+Description=ModSecurity Rule 777007 Bad Bot Monitor + CSF Blocker
+Documentation=file:///usr/local/bin/monitor_modsec.py
+After=network.target lsws.service csf.service
+Wants=csf.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/modsec_bot_monitor
+
+ExecStart=/usr/bin/python3 /usr/local/bin/monitor_modsec.py
+Restart=always
+RestartSec=15
+
+# Allow clean shutdown time before SIGKILL
+TimeoutStopSec=30
+
+# Logging goes to journald via stdout
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=modsec-bot-monitor
+
+# Resource limits
+MemoryMax=128M
+CPUQuota=20%
+
+# Hardening (keep root for csf access, but lock down the rest)
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/modsec_bot_monitor /var/log/httpd /etc/csf
+
+[Install]
+WantedBy=multi-user.target
