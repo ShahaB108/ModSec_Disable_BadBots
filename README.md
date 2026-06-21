@@ -36,7 +36,7 @@ A lightweight ModSecurity and CSF integration project designed to identify, moni
 ## Installation
 
 ```bash
-git clone https://github.com/USERNAME/ModSec_Disable_BadBots.git
+git clone https://github.com/ShahaB108/ModSec_Disable_BadBots.git
 cd ModSec_Disable_BadBots
 
 chmod +x installer.sh
