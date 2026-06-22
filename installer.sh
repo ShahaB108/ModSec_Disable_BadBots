@@ -59,8 +59,8 @@ preflight() {
         ok "$bin found at $(command -v $bin)"
     done
 
-    python3 -c "import sys; assert sys.version_info >= (3,11)" 2>/dev/null \
-        || error "Python 3.11+ required. Found: $(python3 --version)"
+    python3 -c "import sys; assert sys.version_info >= (3,9)" 2>/dev/null \
+        || error "Python 3.9+ required. Found: $(python3 --version)"
     ok "Python version: $(python3 --version)"
 
     [[ -d "$MODSEC_DIR" ]] \
