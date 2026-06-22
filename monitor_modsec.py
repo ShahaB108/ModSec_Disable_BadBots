@@ -210,7 +210,8 @@ def block_ip(ip: str, bot_name: str, count: int, blocked: set) -> bool:
         blocked.add(ip)
         return False
 
-    comment = f"ModSec-777007 BadBot {bot_name} ({count} hits)"
+    # comment = f"ModSec-777007 BadBot {bot_name} ({count} hits)"
+    comment = f"modsec-bot-monitor: Rule 777007 BadBot {bot_name} ({count} hits) - {time.strftime('%a %b %d %H:%M:%S')}"
     try:
         result = subprocess.run(
             ["csf", "-d", ip, comment],
