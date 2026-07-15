@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
@@ -27,6 +28,15 @@ CHECK_INTERVAL  = 600       # seconds between runs
 RULE_ID         = "777007"
 BLOCK_THRESHOLD = 10        # cumulative hits before CSF block
 MAX_STATS_KEYS  = 50000     # memory guard: max unique IP+bot combos
+
+# ── Rule file watchdog ────────────────────────────────────
+RULE_FILE       = "/etc/modsecurity.d/777007_block_badbots.conf"
+RULE_URL        = (
+    "https://raw.githubusercontent.com/ShahaB108/"
+    "ModSec_Disable_BadBots/main/777007_block_badbots.conf"
+)
+LSWS_CTL        = "/usr/local/lsws/bin/lswsctrl"
+RULE_CHECK_INTERVAL = 43200   # 12 hours in seconds
 # =========================================================
 
 _shutdown = False
@@ -171,6 +181,68 @@ def extract_bot_name(user_agent: str) -> str:
             if len(name) > 2:
                 return name[:30]
     return "unknown"
+
+
+# ──────────────────── Rule file watchdog ─────────────────────
+
+def check_rule_file():
+    """
+    Verify that RULE_FILE exists on disk. If missing, download it from
+    RULE_URL and reload LiteSpeed. Called every RULE_CHECK_INTERVAL seconds.
+    """
+    if os.path.exists(RULE_FILE):
+        log.debug(f"Rule file OK: {RULE_FILE}")
+        return
+
+    log.warning(f"Rule file missing: {RULE_FILE} — attempting re-download from GitHub")
+
+    tmp_path = RULE_FILE + ".tmp"
+    try:
+        req = urllib.request.Request(
+            RULE_URL,
+            headers={"User-Agent": "modsec-bot-monitor/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+
+        if len(content) < 50:
+            log.error(f"Downloaded file suspiciously small ({len(content)} bytes), aborting")
+            return
+
+        # Atomic write: write to temp then rename so the file is never half-written
+        os.makedirs(os.path.dirname(RULE_FILE), exist_ok=True)
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+        os.replace(tmp_path, RULE_FILE)
+        log.info(f"Rule file restored ({len(content)} bytes) → {RULE_FILE}")
+
+    except urllib.error.URLError as e:
+        log.error(f"Download failed: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return
+    except Exception as e:
+        log.error(f"Unexpected error restoring rule file: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return
+
+    # Reload LiteSpeed so ModSecurity picks up the restored rule
+    try:
+        result = subprocess.run(
+            [LSWS_CTL, "restart"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            log.info("LiteSpeed reloaded successfully after rule restore")
+        else:
+            log.warning(f"LiteSpeed reload returned non-zero: {result.stderr.strip()}")
+    except FileNotFoundError:
+        log.error(f"lswsctrl not found at {LSWS_CTL} — rule restored but LiteSpeed NOT reloaded")
+    except subprocess.TimeoutExpired:
+        log.error("LiteSpeed reload timed out")
+    except Exception as e:
+        log.error(f"Unexpected error reloading LiteSpeed: {e}")
 
 
 # ──────────────────── CSF integration ────────────────────────
@@ -337,11 +409,26 @@ def main():
         f"threshold={BLOCK_THRESHOLD} hits, {len(blocked)} IPs pre-loaded from history"
     )
 
+    # Rule file watchdog: check immediately on startup, then every 12 hours
+    try:
+        check_rule_file()
+    except Exception as e:
+        log.error(f"Unhandled error in rule file check: {e}", exc_info=True)
+    last_rule_check = time.monotonic()
+
     while not _shutdown:
         try:
             run_cycle(blocked)
         except Exception as e:
             log.error(f"Unhandled error in cycle: {e}", exc_info=True)
+
+        # Check rule file every RULE_CHECK_INTERVAL seconds (independent of CHECK_INTERVAL)
+        if time.monotonic() - last_rule_check >= RULE_CHECK_INTERVAL:
+            try:
+                check_rule_file()
+            except Exception as e:
+                log.error(f"Unhandled error in rule file check: {e}", exc_info=True)
+            last_rule_check = time.monotonic()
 
         # Sleep in short chunks so SIGTERM is handled quickly
         for _ in range(CHECK_INTERVAL // 5):
