@@ -30,12 +30,12 @@ BLOCK_THRESHOLD = 10        # cumulative hits before CSF block
 MAX_STATS_KEYS  = 50000     # memory guard: max unique IP+bot combos
 
 # ── Rule file watchdog ────────────────────────────────────
-RULE_FILE       = "/etc/modsecurity.d/777007_block_badbots.conf"
-RULE_URL        = (
+RULE_FILE           = "/etc/modsecurity.d/777007_block_badbots.conf"
+RULE_URL            = (
     "https://raw.githubusercontent.com/ShahaB108/"
     "ModSec_Disable_BadBots/main/777007_block_badbots.conf"
 )
-LSWS_CTL        = "/usr/local/lsws/bin/lswsctrl"
+LSWS_CTL            = "/usr/local/lsws/bin/lswsctrl"
 RULE_CHECK_INTERVAL = 43200   # 12 hours in seconds
 # =========================================================
 
@@ -183,12 +183,14 @@ def extract_bot_name(user_agent: str) -> str:
     return "unknown"
 
 
+
 # ──────────────────── Rule file watchdog ─────────────────────
 
 def check_rule_file():
     """
-    Verify that RULE_FILE exists on disk. If missing, download it from
-    RULE_URL and reload LiteSpeed. Called every RULE_CHECK_INTERVAL seconds.
+    Verify RULE_FILE exists. If missing, download it from GitHub and reload
+    LiteSpeed. Uses /tmp for staging so a read-only /etc/modsecurity.d/
+    (e.g. during CustomBuild) does not cause a write error.
     """
     if os.path.exists(RULE_FILE):
         log.debug(f"Rule file OK: {RULE_FILE}")
@@ -196,7 +198,7 @@ def check_rule_file():
 
     log.warning(f"Rule file missing: {RULE_FILE} — attempting re-download from GitHub")
 
-    tmp_path = RULE_FILE + ".tmp"
+    tmp_path = f"/tmp/777007_block_badbots.conf.tmp"
     try:
         req = urllib.request.Request(
             RULE_URL,
@@ -209,15 +211,25 @@ def check_rule_file():
             log.error(f"Downloaded file suspiciously small ({len(content)} bytes), aborting")
             return
 
-        # Atomic write: write to temp then rename so the file is never half-written
-        os.makedirs(os.path.dirname(RULE_FILE), exist_ok=True)
+        # Stage in /tmp first (always writable), then write to final destination.
+        # os.replace() would fail across filesystems, so we open+write directly.
         with open(tmp_path, "wb") as f:
             f.write(content)
-        os.replace(tmp_path, RULE_FILE)
-        log.info(f"Rule file restored ({len(content)} bytes) → {RULE_FILE}")
+
+        os.makedirs(os.path.dirname(RULE_FILE), exist_ok=True)
+        with open(RULE_FILE, "wb") as f:
+            f.write(content)
+
+        os.remove(tmp_path)
+        log.info(f"Rule file restored ({len(content)} bytes) -> {RULE_FILE}")
 
     except urllib.error.URLError as e:
         log.error(f"Download failed: {e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return
+    except OSError as e:
+        log.error(f"Could not write rule file ({e}) — is {os.path.dirname(RULE_FILE)} read-only?")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         return
@@ -422,7 +434,6 @@ def main():
         except Exception as e:
             log.error(f"Unhandled error in cycle: {e}", exc_info=True)
 
-        # Check rule file every RULE_CHECK_INTERVAL seconds (independent of CHECK_INTERVAL)
         if time.monotonic() - last_rule_check >= RULE_CHECK_INTERVAL:
             try:
                 check_rule_file()
