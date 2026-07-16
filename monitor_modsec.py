@@ -13,7 +13,6 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
@@ -33,7 +32,7 @@ MAX_STATS_KEYS  = 50000     # memory guard: max unique IP+bot combos
 RULE_FILE           = "/etc/modsecurity.d/777007_block_badbots.conf"
 RULE_URL            = (
     "https://raw.githubusercontent.com/ShahaB108/"
-    "ModSec_Disable_BadBots/main/777007_block_badbots.conf"
+    "ModSec_Disable_BadBots/refs/heads/main/777007_block_badbots.conf"
 )
 LSWS_CTL            = "/usr/local/lsws/bin/lswsctrl"
 RULE_CHECK_INTERVAL = 43200   # 12 hours in seconds
@@ -188,58 +187,53 @@ def extract_bot_name(user_agent: str) -> str:
 
 def check_rule_file():
     """
-    Verify RULE_FILE exists. If missing, download it from GitHub and reload
-    LiteSpeed. Uses /tmp for staging so a read-only /etc/modsecurity.d/
-    (e.g. during CustomBuild) does not cause a write error.
+    Verify RULE_FILE exists. If missing, download it with wget and reload LiteSpeed.
     """
     if os.path.exists(RULE_FILE):
         log.debug(f"Rule file OK: {RULE_FILE}")
         return
 
-    log.warning(f"Rule file missing: {RULE_FILE} — attempting re-download from GitHub")
+    log.warning(f"Rule file missing: {RULE_FILE} — downloading from GitHub")
 
-    tmp_path = f"/tmp/777007_block_badbots.conf.tmp"
+    tmp_path = "/tmp/777007_block_badbots.conf.tmp"
     try:
-        req = urllib.request.Request(
-            RULE_URL,
-            headers={"User-Agent": "modsec-bot-monitor/1.0"},
+        result = subprocess.run(
+            ["wget", "-q", "-O", tmp_path, RULE_URL],
+            capture_output=True, text=True, timeout=60,
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read()
-
-        if len(content) < 50:
-            log.error(f"Downloaded file suspiciously small ({len(content)} bytes), aborting")
+        if result.returncode != 0:
+            log.error(f"wget failed (exit {result.returncode}): {result.stderr.strip()}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
             return
 
-        # Stage in /tmp first (always writable), then write to final destination.
-        # os.replace() would fail across filesystems, so we open+write directly.
-        with open(tmp_path, "wb") as f:
-            f.write(content)
-
-        os.makedirs(os.path.dirname(RULE_FILE), exist_ok=True)
-        with open(RULE_FILE, "wb") as f:
-            f.write(content)
-
-        os.remove(tmp_path)
-        log.info(f"Rule file restored ({len(content)} bytes) -> {RULE_FILE}")
-
-    except urllib.error.URLError as e:
-        log.error(f"Download failed: {e}")
-        if os.path.exists(tmp_path):
+        size = os.path.getsize(tmp_path)
+        if size < 50:
+            log.error(f"Downloaded file too small ({size} bytes), removing")
             os.remove(tmp_path)
+            return
+
+        # Copy from /tmp to destination (avoids direct write to /etc/modsecurity.d/)
+        import shutil
+        shutil.copy2(tmp_path, RULE_FILE)
+        os.remove(tmp_path)
+
+    except FileNotFoundError:
+        log.error("wget not found — install wget or check PATH")
         return
-    except OSError as e:
-        log.error(f"Could not write rule file ({e}) — is {os.path.dirname(RULE_FILE)} read-only?")
+    except subprocess.TimeoutExpired:
+        log.error("wget timed out after 60s")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         return
     except Exception as e:
-        log.error(f"Unexpected error restoring rule file: {e}")
+        log.error(f"Unexpected error during download: {e}")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         return
 
-    # Reload LiteSpeed so ModSecurity picks up the restored rule
+    log.info(f"Rule file restored ({size} bytes) -> {RULE_FILE}")
+
     try:
         result = subprocess.run(
             [LSWS_CTL, "restart"],
