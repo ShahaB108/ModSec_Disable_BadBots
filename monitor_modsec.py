@@ -35,7 +35,7 @@ RULE_URL            = (
     "ModSec_Disable_BadBots/refs/heads/main/777007_block_badbots.conf"
 )
 LSWS_CTL            = "/usr/local/lsws/bin/lswsctrl"
-RULE_CHECK_INTERVAL = 43200   # 12 hours in seconds
+RULE_CHECK_INTERVAL = 21600   # 6 hours
 # =========================================================
 
 _shutdown = False
