@@ -30,7 +30,7 @@ CPUQuota=20%
 PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/modsec_bot_monitor /var/log/httpd /etc/csf
+ReadWritePaths=/var/lib/modsec_bot_monitor /var/log/httpd /etc/csf /etc/modsecurity.d
 
 [Install]
 WantedBy=multi-user.target
