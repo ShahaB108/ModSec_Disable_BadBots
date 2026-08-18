@@ -22,6 +22,8 @@ MODSEC_DIR="/etc/modsecurity.d"
 # DirectAdmin/CustomBuild "custom" rule dir — files placed here survive
 # CustomBuild rebuilds, unlike unmanaged files dropped directly in MODSEC_DIR.
 CUSTOMBUILD_MODSEC_DIR="/usr/local/directadmin/custombuild/custom/modsecurity/conf"
+# DirectAdmin per-user/domain data dir — home of each domain's .modsecurity_rules toggle file.
+DA_USERS_DIR="/usr/local/directadmin/data/users"
 SCRIPT_DEST="/usr/local/bin/monitor_modsec.py"
 SERVICE_NAME="modsec-bot-monitor"
 SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -236,6 +238,10 @@ install_service() {
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         ok "Service is running"
+        info "On startup, the service scans every domain's .modsecurity_rules file"
+        info "under ${DA_USERS_DIR}/*/domains/ and re-enables"
+        info "ModSecurity ('SecRuleEngine On') wherever it was disabled. Check"
+        info "'journalctl -u ${SERVICE_NAME}' for a report of anything it fixed."
     else
         warn "Service did not start cleanly. Check logs with:"
         warn "  journalctl -u ${SERVICE_NAME} -n 30 --no-pager"

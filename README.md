@@ -107,6 +107,27 @@ systemctl reload lsws
 
 All tunables (paths, thresholds, intervals, URLs) are grouped at the top of `monitor_modsec.py` in a single configuration block, each with an explanatory comment — edit them there.
 
+## Domain-Level ModSecurity Enforcement
+
+[#domain-level-modsecurity-enforcement](#domain-level-modsecurity-enforcement)
+
+DirectAdmin lets a domain owner (or a support tech) switch ModSecurity off per-domain, which silently disables rule 777007 — and every other rule — for that domain, regardless of the server-wide config. Each domain's toggle lives in its own file:
+
+```
+/usr/local/directadmin/data/users/<user>/domains/<domain>.modsecurity_rules
+```
+
+containing a single line, `SecRuleEngine Off` when disabled.
+
+Every `DOMAIN_MODSEC_CHECK_INTERVAL` (default 2h, plus once on service startup), `monitor_modsec.py`:
+
+1. Globs `/usr/local/directadmin/data/users/*/domains/*.modsecurity_rules`.
+2. Flips any `SecRuleEngine Off` line to `SecRuleEngine On` (case/whitespace-insensitive match, everything else in the file left untouched).
+3. Reloads LiteSpeed once at the end, only if at least one domain was changed.
+4. Logs every domain it had to fix, so you have an audit trail of who/what turned it off.
+
+This keeps ModSecurity mandatory site-wide — nobody can leave a domain unprotected for more than one check cycle. Adjust `DOMAIN_MODSEC_CHECK_INTERVAL` in the config block if you want it checked more or less often.
+
 ## DirectAdmin / CustomBuild Persistence
 
 [#directadmin--custombuild-persistence](#directadmin--custombuild-persistence)

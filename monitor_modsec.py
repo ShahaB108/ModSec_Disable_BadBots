@@ -4,6 +4,7 @@ ModSecurity Rule 777007 - Bad Bot Monitor & CSF Blocker
 Production-grade | DirectAdmin + LiteSpeed + CSF
 """
 
+import glob
 import json
 import logging
 import logging.handlers
@@ -40,11 +41,11 @@ CSF_DENY_FILE   = "/etc/csf/csf.deny"
 
 # ── Monitoring cycle behavior ─────────────────────────────
 # Seconds between each log-parsing / blocking cycle.
-CHECK_INTERVAL  = 300
+CHECK_INTERVAL  = 600
 # ModSecurity rule ID this service watches for in the audit log.
 RULE_ID         = "777007"
 # Cumulative hit count (per IP+bot) required before CSF blocks the IP.
-BLOCK_THRESHOLD = 5
+BLOCK_THRESHOLD = 10
 # Memory guard: max unique IP+bot combos kept in the stats table.
 MAX_STATS_KEYS  = 50000
 
@@ -65,7 +66,19 @@ RULE_URL              = (
 # LiteSpeed control binary, used to reload the webserver after a restore.
 LSWS_CTL              = "/usr/local/lsws/bin/lswsctrl"
 # How often (seconds) to re-verify both rule file locations exist.
-RULE_CHECK_INTERVAL   = 7200   # 2 hours
+RULE_CHECK_INTERVAL   = 21600   # 6 hours
+
+# ── Per-domain ModSecurity enforcement ──────────────────────
+# DirectAdmin per-user data directory. Each domain has its own
+# <domain>.modsecurity_rules file under <user>/domains/ that can turn
+# ModSecurity (and therefore rule 777007) off for that domain alone.
+DA_USERS_DIR             = "/usr/local/directadmin/data/users"
+# Glob pattern (relative to DA_USERS_DIR) matching every domain's
+# per-domain ModSecurity toggle file.
+DOMAIN_MODSEC_RULES_GLOB = "*/domains/*.modsecurity_rules"
+# How often (seconds) to scan all domains and re-enable ModSecurity on
+# any that have been switched off (e.g. via DirectAdmin UI or manually).
+DOMAIN_MODSEC_CHECK_INTERVAL = 7200   # 2 hours
 # =========================================================
 
 _shutdown = False
@@ -344,6 +357,83 @@ def check_rule_file():
     _reload_litespeed()
 
 
+# ── Per-domain ModSecurity enforcement ──────────────────────
+
+_SEC_RULE_ENGINE_OFF_RE = re.compile(r"^(\s*SecRuleEngine\s+)Off\b", re.IGNORECASE | re.MULTILINE)
+
+
+def _enable_modsecurity_in_file(path: str) -> bool:
+    """
+    Flip 'SecRuleEngine Off' -> 'SecRuleEngine On' in a single
+    .modsecurity_rules file. Returns True if the file was changed.
+    Writes via a tmp file + os.replace in the same directory for an
+    atomic, permission-safe update (same pattern as the rule watchdog).
+    """
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+    except Exception as e:
+        log.error(f"Failed to read {path}: {e}")
+        return False
+
+    if not _SEC_RULE_ENGINE_OFF_RE.search(content):
+        return False
+
+    new_content = _SEC_RULE_ENGINE_OFF_RE.sub(r"\1On", content)
+
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(new_content)
+        os.replace(tmp_path, path)
+        return True
+    except Exception as e:
+        log.error(f"Failed to write {path}: {e}")
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        return False
+
+
+def enforce_modsecurity_enabled():
+    """
+    Scan every domain's DirectAdmin .modsecurity_rules file and
+    re-enable ModSecurity ('SecRuleEngine On') wherever it's been
+    switched off, so rule 777007 (and every other rule) stays active
+    site-wide. Reloads LiteSpeed once at the end if anything changed.
+    """
+    pattern = os.path.join(DA_USERS_DIR, DOMAIN_MODSEC_RULES_GLOB)
+    try:
+        matches = glob.glob(pattern)
+    except Exception as e:
+        log.error(f"Failed to glob {pattern}: {e}")
+        return
+
+    if not matches:
+        log.debug(f"No domain ModSecurity rule files found under {DA_USERS_DIR}")
+        return
+
+    fixed = []
+    for path in matches:
+        try:
+            if _enable_modsecurity_in_file(path):
+                fixed.append(path)
+        except Exception as e:
+            log.error(f"Unexpected error processing {path}: {e}")
+
+    if not fixed:
+        log.debug(f"Checked {len(matches)} domain(s) — ModSecurity already enabled everywhere")
+        return
+
+    log.warning(f"ModSecurity was disabled on {len(fixed)} domain(s), re-enabled:")
+    for path in fixed:
+        log.warning(f"  -> {path}")
+
+    _reload_litespeed()
+
+
 # ──────────────────── CSF integration ────────────────────────
 
 def is_ip_in_csf_deny(ip: str) -> bool:
@@ -508,12 +598,20 @@ def main():
         f"threshold={BLOCK_THRESHOLD} hits, {len(blocked)} IPs pre-loaded from history"
     )
 
-    # Rule file watchdog: check immediately on startup, then every 12 hours
+    # Rule file watchdog: check immediately on startup, then every RULE_CHECK_INTERVAL
     try:
         check_rule_file()
     except Exception as e:
         log.error(f"Unhandled error in rule file check: {e}", exc_info=True)
     last_rule_check = time.monotonic()
+
+    # Per-domain ModSecurity enforcement: check immediately on startup,
+    # then every DOMAIN_MODSEC_CHECK_INTERVAL
+    try:
+        enforce_modsecurity_enabled()
+    except Exception as e:
+        log.error(f"Unhandled error in domain ModSecurity check: {e}", exc_info=True)
+    last_domain_check = time.monotonic()
 
     while not _shutdown:
         try:
@@ -527,6 +625,13 @@ def main():
             except Exception as e:
                 log.error(f"Unhandled error in rule file check: {e}", exc_info=True)
             last_rule_check = time.monotonic()
+
+        if time.monotonic() - last_domain_check >= DOMAIN_MODSEC_CHECK_INTERVAL:
+            try:
+                enforce_modsecurity_enabled()
+            except Exception as e:
+                log.error(f"Unhandled error in domain ModSecurity check: {e}", exc_info=True)
+            last_domain_check = time.monotonic()
 
         # Sleep in short chunks so SIGTERM is handled quickly
         for _ in range(CHECK_INTERVAL // 5):
