@@ -12,6 +12,7 @@ A lightweight ModSecurity and CSF integration project designed to identify, moni
 * Prevents duplicate firewall entries.
 * Supports DirectAdmin + LiteSpeed environments.
 * Includes a systemd service for continuous monitoring.
+* Mirrors the rule file into DirectAdmin/CustomBuild's `custom` config dir so a CustomBuild rebuild can't silently drop it.
 * Lightweight and production-ready.
 
 ## Included Files
@@ -104,7 +105,18 @@ After making changes, reload LiteSpeed:
 systemctl reload lsws
 ```
 
+All tunables (paths, thresholds, intervals, URLs) are grouped at the top of `monitor_modsec.py` in a single configuration block, each with an explanatory comment — edit them there.
+
+## DirectAdmin / CustomBuild Persistence
+
+[#directadmin--custombuild-persistence](#directadmin--custombuild-persistence)
+
+DirectAdmin's CustomBuild can rebuild ModSecurity's config and remove unmanaged files from `/etc/modsecurity.d`. To prevent the rule from being silently dropped:
+
+- The installer copies `777007_block_badbots.conf` into both `/etc/modsecurity.d` **and** `/usr/local/directadmin/custombuild/custom/modsecurity/conf` (CustomBuild's designated "custom" rule directory, which it preserves across rebuilds).
+- The `monitor_modsec.py` watchdog checks both locations on startup and every `RULE_CHECK_INTERVAL` (default 6h). If the primary file is missing it re-downloads from GitHub and repopulates both paths; if only the CustomBuild copy is missing, it re-mirrors the existing file locally (no re-download).
+- This step is skipped automatically on non-DirectAdmin hosts.
+
 ## Disclaimer
 
 This project intentionally blocks a wide range of crawlers, AI agents, scrapers, and indexing bots. Review the rule set carefully before deploying in production environments, especially if you rely on search engine indexing or third-party monitoring services.
-

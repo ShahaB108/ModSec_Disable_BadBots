@@ -19,6 +19,9 @@ URL_RULE="${GITHUB_RAW}/777007_block_badbots.conf"
 RULE_ID="777007"
 RULE_FILE="777007_block_badbots.conf"
 MODSEC_DIR="/etc/modsecurity.d"
+# DirectAdmin/CustomBuild "custom" rule dir — files placed here survive
+# CustomBuild rebuilds, unlike unmanaged files dropped directly in MODSEC_DIR.
+CUSTOMBUILD_MODSEC_DIR="/usr/local/directadmin/custombuild/custom/modsecurity/conf"
 SCRIPT_DEST="/usr/local/bin/monitor_modsec.py"
 SERVICE_NAME="modsec-bot-monitor"
 SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -162,6 +165,19 @@ install_rule() {
     grep -r "id:${RULE_ID}" "$MODSEC_DIR" &>/dev/null \
         && ok "Rule ${RULE_ID} confirmed in ${MODSEC_DIR}" \
         || error "Rule ${RULE_ID} not found after install — check ModSecurity configuration"
+
+    # Mirror into the DirectAdmin/CustomBuild "custom" dir so a CustomBuild
+    # rebuild doesn't silently remove/disable the rule. Only attempted when
+    # DirectAdmin is actually present on this host.
+    if [[ -d "/usr/local/directadmin" ]]; then
+        mkdir -p "$CUSTOMBUILD_MODSEC_DIR" \
+            && cp "${TMP_DIR}/${RULE_FILE}" "${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}" \
+            && chmod 644 "${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}" \
+            && ok "Rule mirrored to CustomBuild custom dir: ${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}" \
+            || warn "Could not mirror rule to ${CUSTOMBUILD_MODSEC_DIR} — CustomBuild rebuilds may drop the rule"
+    else
+        skip "DirectAdmin not detected — skipping CustomBuild mirror"
+    fi
 }
 
 # =============================================================================
@@ -239,6 +255,9 @@ print_summary() {
 
     echo -e "${BLD}Installed files:${NC}"
     echo -e "  ${CYN}ModSec rule${NC}   ${MODSEC_DIR}/${RULE_FILE}"
+    if [[ -d "/usr/local/directadmin" ]]; then
+        echo -e "  ${CYN}CustomBuild mirror${NC} ${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}"
+    fi
     echo -e "  ${CYN}Python script${NC} ${SCRIPT_DEST}"
     echo -e "  ${CYN}Systemd unit${NC}  ${SERVICE_DEST}"
     echo -e "  ${CYN}State dir${NC}     ${STATE_DIR}/"

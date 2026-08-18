@@ -17,25 +17,55 @@ from collections import defaultdict
 from pathlib import Path
 
 # ===================== Configuration =====================
-LOG_FILE        = "/var/log/httpd/modsec_audit.log"
-STATE_DIR       = "/var/lib/modsec_bot_monitor"
-STATE_FILE      = f"{STATE_DIR}/state.json"
-DATA_FILE       = f"{STATE_DIR}/modsec_bad_bots.txt"
-BLOCKED_FILE    = f"{STATE_DIR}/blocked_ips.txt"
-CSF_DENY_FILE   = "/etc/csf/csf.deny"
-CHECK_INTERVAL  = 600       # seconds between runs
-RULE_ID         = "777007"
-BLOCK_THRESHOLD = 10        # cumulative hits before CSF block
-MAX_STATS_KEYS  = 50000     # memory guard: max unique IP+bot combos
+# All tunables live here. Edit this block to customize behavior —
+# nothing below this section should need to change for normal use.
 
-# ── Rule file watchdog ────────────────────────────────────
-RULE_FILE           = "/etc/modsecurity.d/777007_block_badbots.conf"
-RULE_URL            = (
+# ── Paths: ModSecurity audit log ──────────────────────────
+# Path to the ModSecurity JSON audit log this service tails.
+LOG_FILE        = "/var/log/httpd/modsec_audit.log"
+
+# ── Paths: local state / data directory ───────────────────
+# Directory where this service persists its own state and stats.
+STATE_DIR       = "/var/lib/modsec_bot_monitor"
+# Tracks last-read log offset + inode (for log rotation detection).
+STATE_FILE      = f"{STATE_DIR}/state.json"
+# Cumulative "IP + bot name -> hit count" table, written each cycle.
+DATA_FILE       = f"{STATE_DIR}/modsec_bad_bots.txt"
+# List of IPs already blocked via CSF by this service (dedup guard).
+BLOCKED_FILE    = f"{STATE_DIR}/blocked_ips.txt"
+
+# ── CSF (ConfigServer Security & Firewall) integration ────
+# CSF's deny list, read directly to check if an IP is already blocked.
+CSF_DENY_FILE   = "/etc/csf/csf.deny"
+
+# ── Monitoring cycle behavior ─────────────────────────────
+# Seconds between each log-parsing / blocking cycle.
+CHECK_INTERVAL  = 300
+# ModSecurity rule ID this service watches for in the audit log.
+RULE_ID         = "777007"
+# Cumulative hit count (per IP+bot) required before CSF blocks the IP.
+BLOCK_THRESHOLD = 5
+# Memory guard: max unique IP+bot combos kept in the stats table.
+MAX_STATS_KEYS  = 50000
+
+# ── Rule file watchdog ─────────────────────────────────────
+# Primary ModSecurity rule file location (used by ModSecurity itself).
+RULE_FILE            = "/etc/modsecurity.d/777007_block_badbots.conf"
+# DirectAdmin/CustomBuild "custom" rule directory. CustomBuild rebuilds
+# can wipe unmanaged files from /etc/modsecurity.d, but it preserves and
+# reapplies anything placed here — so we mirror the rule file into this
+# path too, keeping it safe across DirectAdmin/CustomBuild updates.
+CUSTOMBUILD_RULE_DIR  = "/usr/local/directadmin/custombuild/custom/modsecurity/conf"
+CUSTOMBUILD_RULE_FILE = f"{CUSTOMBUILD_RULE_DIR}/777007_block_badbots.conf"
+# Source URL used to re-download the rule file if it goes missing.
+RULE_URL              = (
     "https://raw.githubusercontent.com/ShahaB108/"
     "ModSec_Disable_BadBots/refs/heads/main/777007_block_badbots.conf"
 )
-LSWS_CTL            = "/usr/local/lsws/bin/lswsctrl"
-RULE_CHECK_INTERVAL = 21600   # 6 hours
+# LiteSpeed control binary, used to reload the webserver after a restore.
+LSWS_CTL              = "/usr/local/lsws/bin/lswsctrl"
+# How often (seconds) to re-verify both rule file locations exist.
+RULE_CHECK_INTERVAL   = 7200   # 2 hours
 # =========================================================
 
 _shutdown = False
@@ -185,16 +215,27 @@ def extract_bot_name(user_agent: str) -> str:
 
 # ──────────────────── Rule file watchdog ─────────────────────
 
-def check_rule_file():
+def _copy_into_place(src: str, dest: str) -> bool:
     """
-    Verify RULE_FILE exists. If missing, download it with wget and reload LiteSpeed.
+    Copy src -> dest via /tmp staging, avoiding direct writes to
+    guarded directories (e.g. Imunify360's real-time file guard on
+    /etc/modsecurity.d). Creates dest's parent directory if needed.
     """
-    if os.path.exists(RULE_FILE):
-        log.debug(f"Rule file OK: {RULE_FILE}")
-        return
+    import shutil
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(src, dest)
+        return True
+    except Exception as e:
+        log.error(f"Failed to copy rule file to {dest}: {e}")
+        return False
 
-    log.warning(f"Rule file missing: {RULE_FILE} — downloading from GitHub")
 
+def _download_rule_file():
+    """
+    Download the rule file from GitHub into /tmp. Returns the temp
+    path on success, or None on any failure (already logged).
+    """
     tmp_path = "/tmp/777007_block_badbots.conf.tmp"
     try:
         result = subprocess.run(
@@ -205,35 +246,32 @@ def check_rule_file():
             log.error(f"wget failed (exit {result.returncode}): {result.stderr.strip()}")
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            return
+            return None
 
         size = os.path.getsize(tmp_path)
         if size < 50:
             log.error(f"Downloaded file too small ({size} bytes), removing")
             os.remove(tmp_path)
-            return
+            return None
 
-        # Copy from /tmp to destination (avoids direct write to /etc/modsecurity.d/)
-        import shutil
-        shutil.copy2(tmp_path, RULE_FILE)
-        os.remove(tmp_path)
+        return tmp_path
 
     except FileNotFoundError:
         log.error("wget not found — install wget or check PATH")
-        return
+        return None
     except subprocess.TimeoutExpired:
         log.error("wget timed out after 60s")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return
+        return None
     except Exception as e:
         log.error(f"Unexpected error during download: {e}")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return
+        return None
 
-    log.info(f"Rule file restored ({size} bytes) -> {RULE_FILE}")
 
+def _reload_litespeed():
     try:
         result = subprocess.run(
             [LSWS_CTL, "restart"],
@@ -249,6 +287,61 @@ def check_rule_file():
         log.error("LiteSpeed reload timed out")
     except Exception as e:
         log.error(f"Unexpected error reloading LiteSpeed: {e}")
+
+
+def check_rule_file():
+    """
+    Verify the rule file exists in BOTH locations:
+      - RULE_FILE            (active ModSecurity config)
+      - CUSTOMBUILD_RULE_FILE (DirectAdmin/CustomBuild "custom" dir,
+                                so a CustomBuild rebuild won't drop it)
+
+    If RULE_FILE is missing, download fresh from GitHub and place it
+    in both locations, then reload LiteSpeed. If only the CustomBuild
+    copy is missing, just re-mirror the existing RULE_FILE — no
+    download needed.
+    """
+    modsec_ok      = os.path.exists(RULE_FILE)
+    custombuild_ok = os.path.exists(CUSTOMBUILD_RULE_FILE)
+
+    if modsec_ok and custombuild_ok:
+        log.debug(f"Rule file OK in both locations: {RULE_FILE}, {CUSTOMBUILD_RULE_FILE}")
+        return
+
+    if modsec_ok and not custombuild_ok:
+        log.warning(
+            f"CustomBuild copy missing: {CUSTOMBUILD_RULE_FILE} — "
+            f"re-mirroring from {RULE_FILE}"
+        )
+        if _copy_into_place(RULE_FILE, CUSTOMBUILD_RULE_FILE):
+            log.info(f"CustomBuild copy restored -> {CUSTOMBUILD_RULE_FILE}")
+        return
+
+    log.warning(f"Rule file missing: {RULE_FILE} — downloading from GitHub")
+
+    tmp_path = _download_rule_file()
+    if tmp_path is None:
+        return
+
+    size = os.path.getsize(tmp_path)
+    ok_main = _copy_into_place(tmp_path, RULE_FILE)
+    ok_custombuild = _copy_into_place(tmp_path, CUSTOMBUILD_RULE_FILE)
+    os.remove(tmp_path)
+
+    if not ok_main:
+        log.error("Failed to restore rule file to primary ModSecurity path")
+        return
+
+    log.info(f"Rule file restored ({size} bytes) -> {RULE_FILE}")
+    if ok_custombuild:
+        log.info(f"Rule file mirrored -> {CUSTOMBUILD_RULE_FILE}")
+    else:
+        log.warning(
+            f"Primary rule file restored, but mirroring to "
+            f"{CUSTOMBUILD_RULE_FILE} failed — see error above"
+        )
+
+    _reload_litespeed()
 
 
 # ──────────────────── CSF integration ────────────────────────
