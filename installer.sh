@@ -134,6 +134,47 @@ download_files() {
 }
 
 # =============================================================================
+#  CLEANUP — remove previous install before reinstalling
+# =============================================================================
+# Without this, re-running the installer on a host that already has the
+# service/script/state dir in place is a silent no-op: install_service()
+# only stops+overwrites the unit file, but the Python script and state dir
+# are otherwise left untouched, so a new monitor_modsec.py never actually
+# lands. Wiping these three paths first makes every run a clean, full
+# reinstall — same behavior whether this is the first install or the tenth.
+cleanup_previous_install() {
+    section "Cleanup — removing previous install (if any)"
+
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        info "Stopping running service before cleanup..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+
+    if [[ -f "$SCRIPT_DEST" ]]; then
+        rm -f "$SCRIPT_DEST"
+        ok "Removed old script: $SCRIPT_DEST"
+    else
+        skip "No existing script at $SCRIPT_DEST"
+    fi
+
+    if [[ -f "$SERVICE_DEST" ]]; then
+        rm -f "$SERVICE_DEST"
+        systemctl daemon-reload
+        ok "Removed old service unit: $SERVICE_DEST"
+    else
+        skip "No existing service unit at $SERVICE_DEST"
+    fi
+
+    if [[ -d "$STATE_DIR" ]]; then
+        warn "Removing state dir $STATE_DIR — this clears blocked-IP history and hit stats"
+        rm -rf "$STATE_DIR"
+        ok "Removed old state dir: $STATE_DIR"
+    else
+        skip "No existing state dir at $STATE_DIR"
+    fi
+}
+
+# =============================================================================
 #  STEP 1 — ModSecurity Rule
 # =============================================================================
 install_rule() {
@@ -326,6 +367,7 @@ banner
 preflight
 detect_namespace_support
 download_files
+cleanup_previous_install
 install_rule
 install_script
 install_statedir
