@@ -44,6 +44,8 @@ chmod +x installer.sh
 ./installer.sh
 ```
 
+Re-running `installer.sh` on a host that already has the service installed does a **full clean reinstall**: it stops the running service and removes the existing `/usr/local/bin/monitor_modsec.py`, `/etc/systemd/system/modsec-bot-monitor.service`, and `/var/lib/modsec_bot_monitor/` before reinstalling — so an update always actually lands, and you're not left running stale code. Note this clears blocked-IP history and hit stats; ModSecurity rule 777007 itself is left alone if already present (it's not part of this cleanup).
+
 ## How It Works
 
 1. ModSecurity Rule `777007` detects requests from known crawlers and bots.
