@@ -45,7 +45,7 @@ CHECK_INTERVAL  = 600
 # ModSecurity rule ID this service watches for in the audit log.
 RULE_ID         = "777007"
 # Cumulative hit count (per IP+bot) required before CSF blocks the IP.
-BLOCK_THRESHOLD = 10
+BLOCK_THRESHOLD = 30
 # Memory guard: max unique IP+bot combos kept in the stats table.
 MAX_STATS_KEYS  = 50000
 
@@ -76,9 +76,12 @@ DA_USERS_DIR             = "/usr/local/directadmin/data/users"
 # Glob pattern (relative to DA_USERS_DIR) matching every domain's
 # per-domain ModSecurity toggle file.
 DOMAIN_MODSEC_RULES_GLOB = "*/domains/*.modsecurity_rules"
-# How often (seconds) to scan all domains and re-enable ModSecurity on
-# any that have been switched off (e.g. via DirectAdmin UI or manually).
-DOMAIN_MODSEC_CHECK_INTERVAL = 7200   # 2 hours
+# NOTE: ModSecurity is force-enabled on all domains only ONCE, on service
+# startup (i.e. effectively at install time). After that, this service
+# never flips a domain back on by itself — if an admin or DirectAdmin
+# user turns it off later, that's respected. Every monitoring cycle just
+# logs a warning for any domain currently found disabled, so it's visible
+# without being silently overridden.
 # =========================================================
 
 _shutdown = False
@@ -434,6 +437,42 @@ def enforce_modsecurity_enabled():
     _reload_litespeed()
 
 
+def check_domain_modsec_status():
+    """
+    Read-only check: scan every domain's .modsecurity_rules file and log
+    a warning for any domain currently disabled ('SecRuleEngine Off').
+    Unlike enforce_modsecurity_enabled(), this NEVER modifies files or
+    reloads LiteSpeed — it only reports. Intended to run on every
+    monitoring cycle so a disabled domain stays visible in the logs
+    without this service silently flipping it back on behind an admin's
+    or user's back after the one-time startup enforcement.
+    """
+    pattern = os.path.join(DA_USERS_DIR, DOMAIN_MODSEC_RULES_GLOB)
+    try:
+        matches = glob.glob(pattern)
+    except Exception as e:
+        log.error(f"Failed to glob {pattern}: {e}")
+        return
+
+    if not matches:
+        return
+
+    disabled = []
+    for path in matches:
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+        except Exception as e:
+            log.error(f"Failed to read {path}: {e}")
+            continue
+
+        if _SEC_RULE_ENGINE_OFF_RE.search(content):
+            disabled.append(path)
+
+    for path in disabled:
+        log.warning(f"ModSecurity is disabled for domain: {path}")
+
+
 # ──────────────────── CSF integration ────────────────────────
 
 def is_ip_in_csf_deny(ip: str) -> bool:
@@ -605,13 +644,14 @@ def main():
         log.error(f"Unhandled error in rule file check: {e}", exc_info=True)
     last_rule_check = time.monotonic()
 
-    # Per-domain ModSecurity enforcement: check immediately on startup,
-    # then every DOMAIN_MODSEC_CHECK_INTERVAL
+    # Per-domain ModSecurity enforcement: force-enable ONCE on startup only
+    # (effectively "at install time"). After this, the service never
+    # re-enables a domain on its own — see check_domain_modsec_status()
+    # in the main loop below, which only warns.
     try:
         enforce_modsecurity_enabled()
     except Exception as e:
-        log.error(f"Unhandled error in domain ModSecurity check: {e}", exc_info=True)
-    last_domain_check = time.monotonic()
+        log.error(f"Unhandled error in domain ModSecurity enforcement: {e}", exc_info=True)
 
     while not _shutdown:
         try:
@@ -626,12 +666,12 @@ def main():
                 log.error(f"Unhandled error in rule file check: {e}", exc_info=True)
             last_rule_check = time.monotonic()
 
-        if time.monotonic() - last_domain_check >= DOMAIN_MODSEC_CHECK_INTERVAL:
-            try:
-                enforce_modsecurity_enabled()
-            except Exception as e:
-                log.error(f"Unhandled error in domain ModSecurity check: {e}", exc_info=True)
-            last_domain_check = time.monotonic()
+        # Read-only: warn (don't re-enable) if a domain currently has
+        # ModSecurity switched off.
+        try:
+            check_domain_modsec_status()
+        except Exception as e:
+            log.error(f"Unhandled error in domain ModSecurity status check: {e}", exc_info=True)
 
         # Sleep in short chunks so SIGTERM is handled quickly
         for _ in range(CHECK_INTERVAL // 5):
