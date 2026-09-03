@@ -28,6 +28,11 @@ SCRIPT_DEST="/usr/local/bin/monitor_modsec.py"
 SERVICE_NAME="modsec-bot-monitor"
 SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
 STATE_DIR="/var/lib/modsec_bot_monitor"
+# Version stamp written here at install time. ServerHub's agent collector
+# checks this exact path first, so the dashboard shows the exact installed
+# commit instead of guessing from file mtimes.
+VERSION_FILE="/usr/local/share/modsec-disable-badbots-version"
+GITHUB_API_COMMIT="https://api.github.com/repos/ShahaB108/ModSec_Disable_BadBots/commits/main"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
@@ -240,10 +245,36 @@ install_script() {
 }
 
 # =============================================================================
-#  STEP 3 — State Directory
+#  STEP 3 — Version stamp
+#  Records which commit was installed, where ServerHub's agent collector
+#  looks for it (/usr/local/share/modsec-disable-badbots-version). Best
+#  effort: if the GitHub API is unreachable the install date is stamped
+#  instead, and this step never fails the install.
+# =============================================================================
+install_version_stamp() {
+    section "Step 3 — Version stamp"
+
+    local sha
+    sha=$(curl -fsSL --max-time 10 "$GITHUB_API_COMMIT" 2>/dev/null \
+        | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("sha",""))[:12])' 2>/dev/null) \
+        || sha=""
+    if [[ -z "${sha:-}" ]]; then
+        sha="unknown"
+        warn "Could not resolve latest commit SHA (GitHub API unreachable?) — stamping date only"
+    fi
+
+    local stamp="main@${sha} installed $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$(dirname "$VERSION_FILE")"
+    echo "$stamp" > "$VERSION_FILE"
+    chmod 644 "$VERSION_FILE"
+    ok "Version stamp written: $(cat "$VERSION_FILE")"
+}
+
+# =============================================================================
+#  STEP 4 — State Directory
 # =============================================================================
 install_statedir() {
-    section "Step 3 — State/data directory"
+    section "Step 4 — State/data directory"
 
     mkdir -p "$STATE_DIR"
     chmod 750 "$STATE_DIR"
@@ -256,10 +287,10 @@ install_statedir() {
 }
 
 # =============================================================================
-#  STEP 4 — Systemd Service
+#  STEP 5 — Systemd Service
 # =============================================================================
 install_service() {
-    section "Step 4 — Systemd service"
+    section "Step 5 — Systemd service"
 
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         info "Stopping existing service..."
@@ -308,6 +339,7 @@ print_summary() {
     echo -e "  ${CYN}Python script${NC} ${SCRIPT_DEST}"
     echo -e "  ${CYN}Systemd unit${NC}  ${SERVICE_DEST}"
     echo -e "  ${CYN}State dir${NC}     ${STATE_DIR}/"
+    echo -e "  ${CYN}Version stamp${NC}  ${VERSION_FILE} ($(cat "$VERSION_FILE" 2>/dev/null || echo 'n/a'))"
     echo ""
 
     echo -e "${BLD}Service management:${NC}"
@@ -370,6 +402,7 @@ download_files
 cleanup_previous_install
 install_rule
 install_script
+install_version_stamp
 install_statedir
 install_service
 print_summary
