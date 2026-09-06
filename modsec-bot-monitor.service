@@ -35,7 +35,7 @@ PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/modsec-bot-monitor /var/log/httpd /etc/csf /etc/modsecurity.d /usr/local/directadmin/custombuild/custom/modsecurity /usr/local/directadmin/data/users
+ReadWritePaths=/opt/modsec-bot-monitor /var/log/httpd /usr/local/lsws /etc/csf /etc/modsecurity.d /usr/local/directadmin/custombuild/custom/modsecurity /usr/local/directadmin/data/users
 
 [Install]
 WantedBy=multi-user.target
