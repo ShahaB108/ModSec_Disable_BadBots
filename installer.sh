@@ -2,12 +2,23 @@
 # =============================================================================
 #  ModSecurity Bad Bot Monitor — Installer
 #  Project : ModSec_Disable_BadBots
+#  Version : 2.1.0
 #  GitHub  : https://github.com/ShahaB108/ModSec_Disable_BadBots
 #  Stack   : DirectAdmin + LiteSpeed Enterprise + CSF Firewall
 #  Run as  : root
+#
+#  Since v2.1.0 ALL service-owned files and directories live under
+#  /opt/modsec-bot-monitor (bin/, rules/, state/, systemd/, VERSION).
+#  Only thin integration points remain outside: the systemd unit is
+#  symlinked from /etc/systemd/system, the rule is mirrored into
+#  /etc/modsecurity.d and CustomBuild's custom dir, and the legacy
+#  ServerHub version-stamp path is kept working via a symlink.
 # =============================================================================
 
 set -euo pipefail
+
+# ── Version ───────────────────────────────────────────────────────────────────
+SERVICE_VERSION="2.1.0"
 
 # ── Source URLs ───────────────────────────────────────────────────────────────
 GITHUB_RAW="https://raw.githubusercontent.com/ShahaB108/ModSec_Disable_BadBots/refs/heads/main"
@@ -15,23 +26,34 @@ URL_SCRIPT="${GITHUB_RAW}/monitor_modsec.py"
 URL_SERVICE="${GITHUB_RAW}/modsec-bot-monitor.service"
 URL_RULE="${GITHUB_RAW}/777007_block_badbots.conf"
 
-# ── Destination paths ─────────────────────────────────────────────────────────
+# ── Destination paths (v2.1.0 layout — everything under /opt) ─────────────────
+INSTALL_DIR="/opt/modsec-bot-monitor"
 RULE_ID="777007"
 RULE_FILE="777007_block_badbots.conf"
+# Master copy of the ModSecurity rule — the source of truth, watched and
+# restored by the monitor's rule watchdog (a GitHub download is only the
+# last-resort fallback when the master itself cannot be recovered).
+RULES_DIR="${INSTALL_DIR}/rules"
+MASTER_RULE_FILE="${RULES_DIR}/${RULE_FILE}"
 MODSEC_DIR="/etc/modsecurity.d"
 # DirectAdmin/CustomBuild "custom" rule dir — files placed here survive
 # CustomBuild rebuilds, unlike unmanaged files dropped directly in MODSEC_DIR.
-CUSTOMBUILD_MODSEC_DIR="/usr/local/directadmin/custombuild/custom/modsecurity/conf"
+DA_DIR="/usr/local/directadmin"
+CUSTOMBUILD_MODSEC_DIR="${DA_DIR}/custombuild/custom/modsecurity/conf"
 # DirectAdmin per-user/domain data dir — home of each domain's .modsecurity_rules toggle file.
-DA_USERS_DIR="/usr/local/directadmin/data/users"
-SCRIPT_DEST="/usr/local/bin/monitor_modsec.py"
+DA_USERS_DIR="${DA_DIR}/data/users"
+BIN_DIR="${INSTALL_DIR}/bin"
+SCRIPT_DEST="${BIN_DIR}/monitor_modsec.py"
+SYSTEMD_DIR="${INSTALL_DIR}/systemd"
+UNIT_SOURCE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 SERVICE_NAME="modsec-bot-monitor"
 SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
-STATE_DIR="/var/lib/modsec_bot_monitor"
-# Version stamp written here at install time. ServerHub's agent collector
-# checks this exact path first, so the dashboard shows the exact installed
-# commit instead of guessing from file mtimes.
-VERSION_FILE="/usr/local/share/modsec-disable-badbots-version"
+STATE_DIR="${INSTALL_DIR}/state"
+# Version stamp written here at install time. The legacy path
+# (/usr/local/share/modsec-disable-badbots-version) is kept as a symlink for
+# ServerHub's agent collector, which checks that exact path first.
+VERSION_FILE="${INSTALL_DIR}/VERSION"
+LEGACY_VERSION_FILE="/usr/local/share/modsec-disable-badbots-version"
 GITHUB_API_COMMIT="https://api.github.com/repos/ShahaB108/ModSec_Disable_BadBots/commits/main"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -49,7 +71,8 @@ banner() {
     echo -e "${CYN}"
     echo "  ╔═══════════════════════════════════════════════════════╗"
     echo "  ║     ModSecurity Bad Bot Monitor — Installer           ║"
-    echo "  ║     Rule ID: 777007 │ LiteSpeed + CSF + DirectAdmin   ║"
+    echo "  ║     Version: ${SERVICE_VERSION} │ Rule ID: 777007          ║"
+    echo "  ║     LiteSpeed + CSF + DirectAdmin                     ║"
     echo "  ╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -139,30 +162,47 @@ download_files() {
 }
 
 # =============================================================================
-#  CLEANUP — remove previous install before reinstalling
+#  CLEANUP / MIGRATION — clear previous install, migrate v2.0.x state
 # =============================================================================
-# Without this, re-running the installer on a host that already has the
-# service/script/state dir in place is a silent no-op: install_service()
-# only stops+overwrites the unit file, but the Python script and state dir
-# are otherwise left untouched, so a new monitor_modsec.py never actually
-# lands. Wiping these three paths first makes every run a clean, full
-# reinstall — same behavior whether this is the first install or the tenth.
+# The Python script, unit file and rule master are always freshly
+# downloaded, so reinstalling them guarantees an update actually lands.
+# Since v2.1.0 the runtime state (blocked-IP history + hit stats) is
+# MIGRATED from the legacy /var/lib/modsec_bot_monitor instead of wiped,
+# so a reinstall no longer loses tracking history.
 cleanup_previous_install() {
-    section "Cleanup — removing previous install (if any)"
+    section "Cleanup / migration — previous install (if any)"
 
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         info "Stopping running service before cleanup..."
         systemctl stop "$SERVICE_NAME"
     fi
 
-    if [[ -f "$SCRIPT_DEST" ]]; then
-        rm -f "$SCRIPT_DEST"
-        ok "Removed old script: $SCRIPT_DEST"
+    # Legacy v2.0.x script location (/usr/local/bin) — superseded by /opt
+    if [[ -e "/usr/local/bin/monitor_modsec.py" && ! -L "/usr/local/bin/monitor_modsec.py" ]]; then
+        rm -f "/usr/local/bin/monitor_modsec.py"
+        ok "Removed legacy script: /usr/local/bin/monitor_modsec.py"
     else
-        skip "No existing script at $SCRIPT_DEST"
+        skip "No legacy script at /usr/local/bin/monitor_modsec.py"
     fi
 
-    if [[ -f "$SERVICE_DEST" ]]; then
+    # Migrate state from the legacy /var/lib/modsec_bot_monitor (v2.0.x)
+    if [[ -d "/var/lib/modsec_bot_monitor" ]]; then
+        mkdir -p "$STATE_DIR"
+        local f
+        for f in state.json modsec_bad_bots.txt blocked_ips.txt; do
+            if [[ -f "/var/lib/modsec_bot_monitor/$f" && ! -e "$STATE_DIR/$f" ]]; then
+                mv "/var/lib/modsec_bot_monitor/$f" "$STATE_DIR/$f"
+            fi
+        done
+        rm -rf "/var/lib/modsec_bot_monitor"
+        ok "Migrated state to $STATE_DIR — blocked-IP history and hit stats preserved"
+    else
+        skip "No legacy state dir at /var/lib/modsec_bot_monitor"
+    fi
+
+    # Old unit file (v2.0.x regular file or stale symlink) — recreated as
+    # a symlink into /opt by install_service()
+    if [[ -e "$SERVICE_DEST" || -L "$SERVICE_DEST" ]]; then
         rm -f "$SERVICE_DEST"
         systemctl daemon-reload
         ok "Removed old service unit: $SERVICE_DEST"
@@ -170,12 +210,13 @@ cleanup_previous_install() {
         skip "No existing service unit at $SERVICE_DEST"
     fi
 
-    if [[ -d "$STATE_DIR" ]]; then
-        warn "Removing state dir $STATE_DIR — this clears blocked-IP history and hit stats"
-        rm -rf "$STATE_DIR"
-        ok "Removed old state dir: $STATE_DIR"
+    # Legacy version stamp (v2.0.x regular file) — recreated as a symlink
+    # to $VERSION_FILE by install_version_stamp()
+    if [[ -e "$LEGACY_VERSION_FILE" && ! -L "$LEGACY_VERSION_FILE" ]]; then
+        rm -f "$LEGACY_VERSION_FILE"
+        ok "Removed legacy version stamp: $LEGACY_VERSION_FILE"
     else
-        skip "No existing state dir at $STATE_DIR"
+        skip "No legacy version stamp file at $LEGACY_VERSION_FILE"
     fi
 }
 
@@ -183,12 +224,21 @@ cleanup_previous_install() {
 #  STEP 1 — ModSecurity Rule
 # =============================================================================
 install_rule() {
-    section "Step 1 — ModSecurity Rule ${RULE_ID}"
+    section "Step 1 — ModSecurity Rule ${RULE_ID} (v${SERVICE_VERSION})"
 
+    # Master copy under /opt — ALWAYS refreshed. It is the source of truth
+    # the service's rule watchdog mirrors from; GitHub is only the fallback
+    # if the master itself goes missing.
+    mkdir -p "$RULES_DIR"
+    cp "${TMP_DIR}/${RULE_FILE}" "$MASTER_RULE_FILE"
+    chmod 644 "$MASTER_RULE_FILE"
+    ok "Rule master installed: $MASTER_RULE_FILE"
+
+    # Active copy included by ModSecurity
     local dest="${MODSEC_DIR}/${RULE_FILE}"
 
-    if grep -r --include="*.conf" "id:${RULE_ID}" "$MODSEC_DIR" &>/dev/null; then
-        skip "Rule ${RULE_ID} already exists — skipping. To reinstall, remove existing file first."
+    if [[ -f "$dest" ]] && grep -q "id:${RULE_ID}" "$dest" 2>/dev/null; then
+        skip "Rule ${RULE_ID} already active at $dest — the service watchdog re-syncs it from the master on startup"
         RULE_INSTALLED=false
     else
         cp "${TMP_DIR}/${RULE_FILE}" "$dest"
@@ -217,7 +267,7 @@ install_rule() {
     # Mirror into the DirectAdmin/CustomBuild "custom" dir so a CustomBuild
     # rebuild doesn't silently remove/disable the rule. Only attempted when
     # DirectAdmin is actually present on this host.
-    if [[ -d "/usr/local/directadmin" ]]; then
+    if [[ -d "$DA_DIR" ]]; then
         mkdir -p "$CUSTOMBUILD_MODSEC_DIR" \
             && cp "${TMP_DIR}/${RULE_FILE}" "${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}" \
             && chmod 644 "${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}" \
@@ -234,6 +284,7 @@ install_rule() {
 install_script() {
     section "Step 2 — Python monitor script"
 
+    mkdir -p "$BIN_DIR"
     cp "${TMP_DIR}/monitor_modsec.py" "$SCRIPT_DEST"
     chmod 750 "$SCRIPT_DEST"
     chown root:root "$SCRIPT_DEST"
@@ -246,13 +297,15 @@ install_script() {
 
 # =============================================================================
 #  STEP 3 — Version stamp
-#  Records which commit was installed, where ServerHub's agent collector
-#  looks for it (/usr/local/share/modsec-disable-badbots-version). Best
-#  effort: if the GitHub API is unreachable the install date is stamped
-#  instead, and this step never fails the install.
+#  Records the installed service version + commit in
+#  /opt/modsec-bot-monitor/VERSION. The legacy path used by ServerHub's
+#  agent collector (/usr/local/share/modsec-disable-badbots-version) is
+#  kept working via a symlink. Best effort: if the GitHub API is
+#  unreachable the install date is stamped instead, and this step never
+#  fails the install.
 # =============================================================================
 install_version_stamp() {
-    section "Step 3 — Version stamp"
+    section "Step 3 — Version stamp (${SERVICE_VERSION})"
 
     local sha
     sha=$(curl -fsSL --max-time 10 "$GITHUB_API_COMMIT" 2>/dev/null \
@@ -263,11 +316,22 @@ install_version_stamp() {
         warn "Could not resolve latest commit SHA (GitHub API unreachable?) — stamping date only"
     fi
 
-    local stamp="main@${sha} installed $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local stamp="${SERVICE_VERSION} main@${sha} installed $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     mkdir -p "$(dirname "$VERSION_FILE")"
     echo "$stamp" > "$VERSION_FILE"
     chmod 644 "$VERSION_FILE"
     ok "Version stamp written: $(cat "$VERSION_FILE")"
+
+    # Keep the legacy ServerHub collector path working via a symlink
+    mkdir -p "$(dirname "$LEGACY_VERSION_FILE")"
+    if [[ -e "$LEGACY_VERSION_FILE" || -L "$LEGACY_VERSION_FILE" ]]; then
+        rm -f "$LEGACY_VERSION_FILE"
+    fi
+    if ln -sfn "$VERSION_FILE" "$LEGACY_VERSION_FILE"; then
+        ok "Legacy stamp path linked: $LEGACY_VERSION_FILE -> $VERSION_FILE"
+    else
+        warn "Could not create legacy stamp symlink at $LEGACY_VERSION_FILE"
+    fi
 }
 
 # =============================================================================
@@ -280,7 +344,11 @@ install_statedir() {
     chmod 750 "$STATE_DIR"
     ok "Directory ready: $STATE_DIR"
 
-    info "Files that will be created here at runtime:"
+    if [[ -n "$(ls -A "$STATE_DIR" 2>/dev/null)" ]]; then
+        info "Existing state detected — blocked-IP history and hit stats preserved"
+    fi
+
+    info "Files that live here:"
     echo -e "    ${CYN}state.json${NC}         — log offset + inode (for log rotation detection)"
     echo -e "    ${CYN}modsec_bad_bots.txt${NC} — cumulative IP/bot hit counts"
     echo -e "    ${CYN}blocked_ips.txt${NC}     — IPs already blocked via CSF (dedup guard)"
@@ -288,6 +356,9 @@ install_statedir() {
 
 # =============================================================================
 #  STEP 5 — Systemd Service
+#  The unit file's home is /opt/modsec-bot-monitor/systemd/; a symlink from
+#  /etc/systemd/system points at it, so the unit lives with the rest of the
+#  service while systemd still finds it in its normal search path.
 # =============================================================================
 install_service() {
     section "Step 5 — Systemd service"
@@ -297,9 +368,17 @@ install_service() {
         systemctl stop "$SERVICE_NAME"
     fi
 
-    cp "${TMP_DIR}/modsec-bot-monitor.service" "$SERVICE_DEST"
-    chmod 644 "$SERVICE_DEST"
-    ok "Service file installed: $SERVICE_DEST"
+    mkdir -p "$SYSTEMD_DIR"
+    cp "${TMP_DIR}/modsec-bot-monitor.service" "$UNIT_SOURCE"
+    chmod 644 "$UNIT_SOURCE"
+    ok "Service unit installed: $UNIT_SOURCE"
+
+    ln -sfn "$UNIT_SOURCE" "$SERVICE_DEST"
+    if [[ "$(readlink -f "$SERVICE_DEST")" == "$UNIT_SOURCE" ]]; then
+        ok "Unit linked: $SERVICE_DEST -> $UNIT_SOURCE"
+    else
+        error "Failed to link $SERVICE_DEST -> $UNIT_SOURCE"
+    fi
 
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" &>/dev/null
@@ -327,19 +406,24 @@ print_summary() {
     echo ""
     echo -e "${GRN}${BLD}"
     echo "  ╔═══════════════════════════════════════════════════════╗"
-    echo "  ║               Installation Complete                   ║"
+    echo "  ║        Installation Complete — v${SERVICE_VERSION}                 ║"
     echo "  ╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
-    echo -e "${BLD}Installed files:${NC}"
-    echo -e "  ${CYN}ModSec rule${NC}   ${MODSEC_DIR}/${RULE_FILE}"
-    if [[ -d "/usr/local/directadmin" ]]; then
+    echo -e "${BLD}Service home (v2.1.0 layout):${NC} ${INSTALL_DIR}/"
+    echo -e "  ${CYN}bin/${NC}        ${SCRIPT_DEST}"
+    echo -e "  ${CYN}rules/${NC}      ${MASTER_RULE_FILE}  (rule master, source of truth)"
+    echo -e "  ${CYN}systemd/${NC}    ${UNIT_SOURCE}"
+    echo -e "  ${CYN}state/${NC}      ${STATE_DIR}/ (state.json, modsec_bad_bots.txt, blocked_ips.txt)"
+    echo -e "  ${CYN}VERSION${NC}     ${VERSION_FILE} ($(cat "$VERSION_FILE" 2>/dev/null || echo 'n/a'))"
+    echo ""
+    echo -e "${BLD}Integration points outside /opt:${NC}"
+    echo -e "  ${CYN}ModSec rule${NC}    ${MODSEC_DIR}/${RULE_FILE} (mirrored from rules/)"
+    if [[ -d "$DA_DIR" ]]; then
         echo -e "  ${CYN}CustomBuild mirror${NC} ${CUSTOMBUILD_MODSEC_DIR}/${RULE_FILE}"
     fi
-    echo -e "  ${CYN}Python script${NC} ${SCRIPT_DEST}"
-    echo -e "  ${CYN}Systemd unit${NC}  ${SERVICE_DEST}"
-    echo -e "  ${CYN}State dir${NC}     ${STATE_DIR}/"
-    echo -e "  ${CYN}Version stamp${NC}  ${VERSION_FILE} ($(cat "$VERSION_FILE" 2>/dev/null || echo 'n/a'))"
+    echo -e "  ${CYN}Systemd unit${NC}   ${SERVICE_DEST} -> ${UNIT_SOURCE}"
+    echo -e "  ${CYN}Legacy stamp${NC}   ${LEGACY_VERSION_FILE} -> ${VERSION_FILE}"
     echo ""
 
     echo -e "${BLD}Service management:${NC}"

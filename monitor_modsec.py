@@ -2,6 +2,13 @@
 """
 ModSecurity Rule 777007 - Bad Bot Monitor & CSF Blocker
 Production-grade | DirectAdmin + LiteSpeed + CSF
+
+Version : 2.1.0
+Layout  : since v2.1.0 all service-owned files live under
+          /opt/modsec-bot-monitor (bin/, rules/, state/, systemd/, VERSION).
+          Only integration points remain outside: the active rule mirror in
+          /etc/modsecurity.d (+ CustomBuild custom dir on DirectAdmin hosts)
+          and the symlinked systemd unit in /etc/systemd/system.
 """
 
 import glob
@@ -21,13 +28,22 @@ from pathlib import Path
 # All tunables live here. Edit this block to customize behavior —
 # nothing below this section should need to change for normal use.
 
+# ── Version ────────────────────────────────────────────────
+VERSION = "2.1.0"
+
+# ── Paths: service home (v2.1.0 layout) ────────────────────
+# Every file this service owns lives under INSTALL_DIR: the script
+# (bin/), the rule master copy (rules/), runtime state (state/) and
+# the systemd unit (systemd/, symlinked into /etc/systemd/system).
+INSTALL_DIR     = "/opt/modsec-bot-monitor"
+
 # ── Paths: ModSecurity audit log ──────────────────────────
 # Path to the ModSecurity JSON audit log this service tails.
 LOG_FILE        = "/var/log/httpd/modsec_audit.log"
 
 # ── Paths: local state / data directory ───────────────────
 # Directory where this service persists its own state and stats.
-STATE_DIR       = "/var/lib/modsec_bot_monitor"
+STATE_DIR       = f"{INSTALL_DIR}/state"
 # Tracks last-read log offset + inode (for log rotation detection).
 STATE_FILE      = f"{STATE_DIR}/state.json"
 # Cumulative "IP + bot name -> hit count" table, written each cycle.
@@ -50,22 +66,29 @@ BLOCK_THRESHOLD = 30
 MAX_STATS_KEYS  = 50000
 
 # ── Rule file watchdog ─────────────────────────────────────
-# Primary ModSecurity rule file location (used by ModSecurity itself).
+# Master copy of the rule — the source of truth for this service.
+MASTER_RULE_DIR      = f"{INSTALL_DIR}/rules"
+MASTER_RULE_FILE     = f"{MASTER_RULE_DIR}/777007_block_badbots.conf"
+# Active copy actually included by ModSecurity.
 RULE_FILE            = "/etc/modsecurity.d/777007_block_badbots.conf"
-# DirectAdmin/CustomBuild "custom" rule directory. CustomBuild rebuilds
-# can wipe unmanaged files from /etc/modsecurity.d, but it preserves and
-# reapplies anything placed here — so we mirror the rule file into this
-# path too, keeping it safe across DirectAdmin/CustomBuild updates.
-CUSTOMBUILD_RULE_DIR  = "/usr/local/directadmin/custombuild/custom/modsecurity/conf"
+# DirectAdmin installation root — when present, the rule is also
+# mirrored into CustomBuild's "custom" rule directory. CustomBuild
+# rebuilds can wipe unmanaged files from /etc/modsecurity.d, but they
+# preserve and reapply anything placed here, keeping the rule safe
+# across DirectAdmin/CustomBuild updates.
+DA_DIR                = "/usr/local/directadmin"
+CUSTOMBUILD_RULE_DIR  = f"{DA_DIR}/custombuild/custom/modsecurity/conf"
 CUSTOMBUILD_RULE_FILE = f"{CUSTOMBUILD_RULE_DIR}/777007_block_badbots.conf"
-# Source URL used to re-download the rule file if it goes missing.
+# Source URL used to re-download the rule file — only as a last-resort
+# fallback when the master copy is missing and cannot be recovered
+# locally from the active copy.
 RULE_URL              = (
     "https://raw.githubusercontent.com/ShahaB108/"
     "ModSec_Disable_BadBots/refs/heads/main/777007_block_badbots.conf"
 )
 # LiteSpeed control binary, used to reload the webserver after a restore.
 LSWS_CTL              = "/usr/local/lsws/bin/lswsctrl"
-# How often (seconds) to re-verify both rule file locations exist.
+# How often (seconds) to re-verify all rule file locations.
 RULE_CHECK_INTERVAL   = 21600   # 6 hours
 
 # ── Per-domain ModSecurity enforcement ──────────────────────
@@ -233,17 +256,27 @@ def extract_bot_name(user_agent: str) -> str:
 
 def _copy_into_place(src: str, dest: str) -> bool:
     """
-    Copy src -> dest via /tmp staging, avoiding direct writes to
-    guarded directories (e.g. Imunify360's real-time file guard on
-    /etc/modsecurity.d). Creates dest's parent directory if needed.
+    Copy src -> dest, creating dest's parent directory if needed and
+    forcing 0644 permissions (rule files must stay world-readable for
+    the webserver, even when restored from a 0600 /tmp download).
     """
     import shutil
     try:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy2(src, dest)
+        os.chmod(dest, 0o644)
         return True
     except Exception as e:
         log.error(f"Failed to copy rule file to {dest}: {e}")
+        return False
+
+
+def _files_identical(path_a: str, path_b: str) -> bool:
+    """True when both files exist and have byte-identical content."""
+    try:
+        with open(path_a, "rb") as fa, open(path_b, "rb") as fb:
+            return fa.read() == fb.read()
+    except Exception:
         return False
 
 
@@ -307,57 +340,77 @@ def _reload_litespeed():
 
 def check_rule_file():
     """
-    Verify the rule file exists in BOTH locations:
-      - RULE_FILE            (active ModSecurity config)
-      - CUSTOMBUILD_RULE_FILE (DirectAdmin/CustomBuild "custom" dir,
-                                so a CustomBuild rebuild won't drop it)
+    Keep the rule file present and consistent in all locations:
 
-    If RULE_FILE is missing, download fresh from GitHub and place it
-    in both locations, then reload LiteSpeed. If only the CustomBuild
-    copy is missing, just re-mirror the existing RULE_FILE — no
-    download needed.
+      MASTER_RULE_FILE       /opt/modsec-bot-monitor/rules/...  (source of truth)
+      RULE_FILE              /etc/modsecurity.d/...             (active copy included by ModSecurity)
+      CUSTOMBUILD_RULE_FILE  DirectAdmin/CustomBuild custom dir (DirectAdmin hosts only)
+
+    Recovery order:
+      1. Master missing, active copy present         -> recover master from the active copy
+      2. Master missing everywhere                   -> download from GitHub into master
+      3. Master present, active copy missing/drifted -> re-mirror master -> active (+ LiteSpeed reload)
+      4. Master present, DA mirror missing/drifted   -> re-mirror master -> CustomBuild dir
     """
-    modsec_ok      = os.path.exists(RULE_FILE)
-    custombuild_ok = os.path.exists(CUSTOMBUILD_RULE_FILE)
+    master_ok = os.path.exists(MASTER_RULE_FILE)
+    active_ok = os.path.exists(RULE_FILE)
 
-    if modsec_ok and custombuild_ok:
-        log.debug(f"Rule file OK in both locations: {RULE_FILE}, {CUSTOMBUILD_RULE_FILE}")
-        return
+    # 1) Establish/recover the master copy first.
+    if not master_ok:
+        if active_ok:
+            log.warning(
+                f"Master rule missing: {MASTER_RULE_FILE} — recovering from {RULE_FILE}"
+            )
+            if _copy_into_place(RULE_FILE, MASTER_RULE_FILE):
+                master_ok = True
+                log.info(f"Master rule recovered -> {MASTER_RULE_FILE}")
+        if not master_ok:
+            log.warning("Rule file missing everywhere — downloading from GitHub as last resort")
+            tmp_path = _download_rule_file()
+            if tmp_path is None:
+                log.error("Could not restore master rule copy — existing copies left untouched")
+                return
+            size = os.path.getsize(tmp_path)
+            master_ok = _copy_into_place(tmp_path, MASTER_RULE_FILE)
+            os.remove(tmp_path)
+            if not master_ok:
+                log.error("Failed to restore master rule copy — see error above")
+                return
+            log.info(f"Master rule restored ({size} bytes) -> {MASTER_RULE_FILE}")
 
-    if modsec_ok and not custombuild_ok:
+    reload_needed = False
+
+    # 2) Active copy: restore if missing, re-sync if drifted.
+    if not active_ok:
+        log.warning(f"Active rule missing: {RULE_FILE} — re-mirroring from master")
+        if _copy_into_place(MASTER_RULE_FILE, RULE_FILE):
+            log.info(f"Active rule restored -> {RULE_FILE}")
+            reload_needed = True
+    elif not _files_identical(MASTER_RULE_FILE, RULE_FILE):
         log.warning(
-            f"CustomBuild copy missing: {CUSTOMBUILD_RULE_FILE} — "
-            f"re-mirroring from {RULE_FILE}"
+            f"Active rule drifted from master — re-syncing {MASTER_RULE_FILE} -> {RULE_FILE}"
         )
-        if _copy_into_place(RULE_FILE, CUSTOMBUILD_RULE_FILE):
-            log.info(f"CustomBuild copy restored -> {CUSTOMBUILD_RULE_FILE}")
-        return
+        if _copy_into_place(MASTER_RULE_FILE, RULE_FILE):
+            log.info(f"Active rule re-synced -> {RULE_FILE}")
+            reload_needed = True
 
-    log.warning(f"Rule file missing: {RULE_FILE} — downloading from GitHub")
+    # 3) CustomBuild mirror: only on DirectAdmin hosts (kept in sync so a
+    #    CustomBuild rebuild can't drop the rule).
+    if os.path.isdir(DA_DIR):
+        if not os.path.exists(CUSTOMBUILD_RULE_FILE):
+            log.warning(
+                f"CustomBuild copy missing: {CUSTOMBUILD_RULE_FILE} — re-mirroring from master"
+            )
+            if _copy_into_place(MASTER_RULE_FILE, CUSTOMBUILD_RULE_FILE):
+                log.info(f"CustomBuild copy restored -> {CUSTOMBUILD_RULE_FILE}")
+        elif not _files_identical(MASTER_RULE_FILE, CUSTOMBUILD_RULE_FILE):
+            log.warning(
+                f"CustomBuild copy drifted from master — re-syncing -> {CUSTOMBUILD_RULE_FILE}"
+            )
+            _copy_into_place(MASTER_RULE_FILE, CUSTOMBUILD_RULE_FILE)
 
-    tmp_path = _download_rule_file()
-    if tmp_path is None:
-        return
-
-    size = os.path.getsize(tmp_path)
-    ok_main = _copy_into_place(tmp_path, RULE_FILE)
-    ok_custombuild = _copy_into_place(tmp_path, CUSTOMBUILD_RULE_FILE)
-    os.remove(tmp_path)
-
-    if not ok_main:
-        log.error("Failed to restore rule file to primary ModSecurity path")
-        return
-
-    log.info(f"Rule file restored ({size} bytes) -> {RULE_FILE}")
-    if ok_custombuild:
-        log.info(f"Rule file mirrored -> {CUSTOMBUILD_RULE_FILE}")
-    else:
-        log.warning(
-            f"Primary rule file restored, but mirroring to "
-            f"{CUSTOMBUILD_RULE_FILE} failed — see error above"
-        )
-
-    _reload_litespeed()
+    if reload_needed:
+        _reload_litespeed()
 
 
 # ── Per-domain ModSecurity enforcement ──────────────────────
@@ -630,10 +683,14 @@ def run_cycle(blocked: set) -> bool:
 
 
 def main():
+    if "--version" in sys.argv[1:]:
+        print(f"modsec-bot-monitor {VERSION}")
+        return
+
     ensure_dirs()
     blocked = load_blocked_ips()
     log.info(
-        f"modsec-bot-monitor started — interval={CHECK_INTERVAL}s, "
+        f"modsec-bot-monitor v{VERSION} started — interval={CHECK_INTERVAL}s, "
         f"threshold={BLOCK_THRESHOLD} hits, {len(blocked)} IPs pre-loaded from history"
     )
 

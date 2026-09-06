@@ -1,16 +1,17 @@
 [Unit]
-Description=ModSecurity Rule 777007 Bad Bot Monitor + CSF Blocker
-Documentation=file:///usr/local/bin/monitor_modsec.py
-After=network.target lsws.service csf.service
+Description=ModSecurity Rule 777007 Bad Bot Monitor + CSF Blocker (v2.1.0)
+Documentation=file:///opt/modsec-bot-monitor/bin/monitor_modsec.py
+After=local-fs.target network.target lsws.service csf.service
 Wants=csf.service
 
 [Service]
 Type=simple
 User=root
 Group=root
-WorkingDirectory=/var/lib/modsec_bot_monitor
+WorkingDirectory=/opt/modsec-bot-monitor
+Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/usr/bin/python3 /usr/local/bin/monitor_modsec.py
+ExecStart=/usr/bin/python3 /opt/modsec-bot-monitor/bin/monitor_modsec.py
 Restart=always
 RestartSec=15
 
@@ -26,11 +27,15 @@ SyslogIdentifier=modsec-bot-monitor
 MemoryMax=128M
 CPUQuota=20%
 
-# Hardening (keep root for csf access, but lock down the rest)
+# Hardening (keep root for csf access, but lock down the rest).
+# /opt/modsec-bot-monitor is the only place the service needs to write
+# (state dir + rule master); the other ReadWritePaths cover the audit
+# log, CSF deny list and the ModSecurity/CustomBuild/DA rule mirrors.
 PrivateTmp=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/modsec_bot_monitor /var/log/httpd /etc/csf /etc/modsecurity.d /usr/local/directadmin/custombuild/custom/modsecurity /usr/local/directadmin/data/users
+ProtectHome=yes
+ReadWritePaths=/opt/modsec-bot-monitor /var/log/httpd /etc/csf /etc/modsecurity.d /usr/local/directadmin/custombuild/custom/modsecurity /usr/local/directadmin/data/users
 
 [Install]
 WantedBy=multi-user.target
